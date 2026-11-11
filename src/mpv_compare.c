@@ -10,8 +10,12 @@
 #include <X11/Xutil.h>
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
+#include <ctype.h>
+#include <dirent.h>
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <strings.h>
+#include <sys/stat.h>
 #include <math.h>
 #include <poll.h>
 #include <pthread.h>
@@ -96,7 +100,7 @@ enum {
   CMD_STEP_FORWARD,
   CMD_STEP_BACKWARD,
   CMD_SPEED,
-  CMD_LOOP,
+  CMD_LOAD_TRACK,
 };
 
 static int cmd_pipe[2] = {-1, -1};
@@ -172,6 +176,19 @@ static int atlas_row_height = 0;
 static const int ATLAS_SIZE = 1024;
 
 static const char* hwdec_mode = "auto-safe";
+
+typedef struct {
+  char** paths;
+  int count;
+} Playlist;
+
+static Playlist playlists[2];
+static atomic_int g_track = 0;
+static atomic_int g_track_total = 1;
+static atomic_int g_list_loop = 0;
+static atomic_int g_list_ended = 0;
+static atomic_int g_autoplay = 0;
+
 static float split = 0.5f;
 static int dragging_split = 0;
 static int dragging_progress = 0;
@@ -263,6 +280,135 @@ static void check_mpv(int status, const char* what) {
 static const char* base_name(const char* path) {
   const char* slash = strrchr(path, '/');
   return slash != NULL ? slash + 1 : path;
+}
+
+// ---------------------------------------------------------------- playlists
+
+static int is_video_file(const char* name) {
+  static const char* extensions[] = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".ts", ".m2ts", ".mpg", ".mpeg", ".flv", ".wmv", ".3gp", ".mts", ".vob",
+                                     ".rmvb", ".rm", NULL};
+  const char* dot = strrchr(name, '.');
+  if (dot == NULL) {
+    return 0;
+  }
+  for (int i = 0; extensions[i] != NULL; i++) {
+    if (strcasecmp(dot, extensions[i]) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+// Orders "clip2" before "clip10" while keeping a stable case-insensitive order.
+static int natural_compare(const char* a, const char* b) {
+  while (*a != 0 && *b != 0) {
+    if (isdigit((unsigned char)*a) && isdigit((unsigned char)*b)) {
+      unsigned long long va = 0;
+      unsigned long long vb = 0;
+      while (isdigit((unsigned char)*a)) {
+        va = va * 10 + (unsigned long long)(*a - '0');
+        a++;
+      }
+      while (isdigit((unsigned char)*b)) {
+        vb = vb * 10 + (unsigned long long)(*b - '0');
+        b++;
+      }
+      if (va != vb) {
+        return va < vb ? -1 : 1;
+      }
+    } else {
+      const int ca = tolower((unsigned char)*a);
+      const int cb = tolower((unsigned char)*b);
+      if (ca != cb) {
+        return ca < cb ? -1 : 1;
+      }
+      a++;
+      b++;
+    }
+  }
+  if (*a != 0) {
+    return 1;
+  }
+  if (*b != 0) {
+    return -1;
+  }
+  return 0;
+}
+
+static int playlist_sort_compare(const void* left, const void* right) {
+  const char* const* a = (const char* const*)left;
+  const char* const* b = (const char* const*)right;
+  return natural_compare(*a, *b);
+}
+
+static void playlist_add(Playlist* playlist, const char* path) {
+  char** grown = realloc(playlist->paths, sizeof(char*) * (size_t)(playlist->count + 1));
+  if (grown == NULL) {
+    die("out of memory while building playlist");
+  }
+  playlist->paths = grown;
+  playlist->paths[playlist->count] = strdup(path);
+  if (playlist->paths[playlist->count] == NULL) {
+    die("out of memory while building playlist");
+  }
+  playlist->count++;
+}
+
+// Returns 1 when the source is a directory.
+static int build_playlist(const char* source, Playlist* playlist) {
+  struct stat status;
+  if (stat(source, &status) != 0) {
+    fprintf(stderr, "mpv-compare: cannot access %s\n", source);
+    exit(1);
+  }
+
+  if (!S_ISDIR(status.st_mode)) {
+    playlist_add(playlist, source);
+    return 0;
+  }
+
+  DIR* dir = opendir(source);
+  if (dir == NULL) {
+    fprintf(stderr, "mpv-compare: cannot open directory %s\n", source);
+    exit(1);
+  }
+
+  struct dirent* entry;
+  while ((entry = readdir(dir)) != NULL) {
+    if (entry->d_name[0] == '.' || !is_video_file(entry->d_name)) {
+      continue;
+    }
+    char full_path[4096];
+    const int written = snprintf(full_path, sizeof(full_path), "%s/%s", source, entry->d_name);
+    if (written <= 0 || written >= (int)sizeof(full_path)) {
+      continue;
+    }
+    struct stat file_status;
+    if (stat(full_path, &file_status) != 0 || !S_ISREG(file_status.st_mode)) {
+      continue;
+    }
+    playlist_add(playlist, full_path);
+  }
+  closedir(dir);
+
+  if (playlist->count == 0) {
+    fprintf(stderr, "mpv-compare: no video files in %s\n", source);
+    exit(1);
+  }
+  qsort(playlist->paths, (size_t)playlist->count, sizeof(char*), playlist_sort_compare);
+  return 1;
+}
+
+static const char* track_path(int side_index, int track) {
+  const Playlist* playlist = &playlists[side_index];
+  if (playlist->count <= 0) {
+    return "";
+  }
+  int index = track % playlist->count;
+  if (index < 0) {
+    index += playlist->count;
+  }
+  return playlist->paths[index];
 }
 
 // ---------------------------------------------------------------- X11 / EGL
@@ -1003,8 +1149,14 @@ static void draw_ui(void) {
   snprintf(time_label, sizeof(time_label), "%s / %s", position_text, duration_text);
   text_draw(button_x + button_w + (float)ui_px(12.0f), (float)(h - bar_height + ui_px(6.0f)), COLOR_WHITE, time_label);
 
-  char status[160];
-  snprintf(status, sizeof(status), "%s  %.2fx%s", paused ? "PAUSED" : "PLAY", speed, loop_enabled ? "  LOOP" : "");
+  char status[200];
+  const int total_tracks = atomic_load(&g_track_total);
+  const int track_index = atomic_load(&g_track);
+  if (total_tracks > 1) {
+    snprintf(status, sizeof(status), "%s  %.2fx%s  %d/%d", paused ? "PAUSED" : "PLAY", speed, loop_enabled ? "  LOOP" : "", track_index + 1, total_tracks);
+  } else {
+    snprintf(status, sizeof(status), "%s  %.2fx%s", paused ? "PAUSED" : "PLAY", speed, loop_enabled ? "  LOOP" : "");
+  }
   const float status_width = text_width(status);
   text_draw((float)w - (float)ui_px(14.0f) - status_width, (float)(h - bar_height + ui_px(6.0f)), COLOR_DIM, status);
 
@@ -1029,7 +1181,7 @@ static void draw_ui(void) {
         "← / →     后退 / 前进 5 秒",
         ", / .     上一帧 / 下一帧",
         "[ / ]     减速 / 加速",
-        "L         循环播放开关",
+        "L         列表循环开关",
         "S         保存截图 (BMP)",
         "F         全屏切换",
         "0         分割线回到中间",
@@ -1190,9 +1342,7 @@ static void send_command(int type, double value) {
   (void)written;
 }
 
-static void init_side(Side* side, const char* path) {
-  side->path = path;
-  side->name = base_name(path);
+static void init_side(Side* side) {
   side->mpv = mpv_create();
   if (side->mpv == NULL) {
     die("mpv_create failed");
@@ -1330,7 +1480,9 @@ static int hwdec_code(const char* name) {
   return 3;
 }
 
-static void worker_execute(const Command* command, double* times, double* duration, int* paused_state, double* sync_suppress) {
+static void worker_load_track(int track, int play, int* paused_state, int* eof, int* current_track);
+
+static void worker_execute(const Command* command, double* times, double* duration, int* paused_state, double* sync_suppress, int* eof, int* current_track) {
   const double now = now_seconds();
   switch (command->type) {
     case CMD_PAUSE: {
@@ -1390,15 +1542,45 @@ static void worker_execute(const Command* command, double* times, double* durati
       atomic_store(&g_speed, value);
       break;
     }
-    case CMD_LOOP: {
-      const char* value = command->value != 0.0 ? "inf" : "no";
-      for (int i = 0; i < 2; i++) {
-        mpv_set_property_string(sides[i].mpv, "loop-file", value);
-      }
+    case CMD_LOAD_TRACK: {
+      worker_load_track((int)command->value, 1, paused_state, eof, current_track);
       break;
     }
     default:
       break;
+  }
+}
+
+static void worker_load_track(int track, int play, int* paused_state, int* eof, int* current_track) {
+  for (int i = 0; i < 2; i++) {
+    const char* load_command[] = {"loadfile", track_path(i, track), "replace", NULL};
+    mpv_command(sides[i].mpv, load_command);
+    eof[i] = 0;
+  }
+  int pause_flag = play ? 0 : 1;
+  for (int i = 0; i < 2; i++) {
+    mpv_set_property(sides[i].mpv, "pause", MPV_FORMAT_FLAG, &pause_flag);
+  }
+  *paused_state = pause_flag;
+  atomic_store(&g_paused, pause_flag);
+  *current_track = track;
+  atomic_store(&g_track, track);
+  atomic_store(&g_list_ended, 0);
+  fprintf(stderr, "[playlist] %d/%d: %s | %s\n", track + 1, atomic_load(&g_track_total), track_path(0, track), track_path(1, track));
+}
+
+static void worker_advance_if_ready(int* paused_state, int* eof, int* current_track) {
+  if (!eof[0] || !eof[1]) {
+    return;
+  }
+  const int total = atomic_load(&g_track_total);
+  const int loop = atomic_load(&g_list_loop);
+  if (total > 0 && (loop || *current_track + 1 < total)) {
+    worker_load_track((*current_track + 1) % total, 1, paused_state, eof, current_track);
+  } else {
+    atomic_fetch_add(&g_list_ended, 1);
+    eof[0] = 0;
+    eof[1] = 0;
   }
 }
 
@@ -1410,13 +1592,8 @@ static void* control_thread_main(void* arg) {
   double sync_suppress = 0.0;
   double next_poll = 0.0;
   double next_sync = now_seconds() + 2.0;
-
-  // The control thread owns all non-render libmpv calls, including loadfile;
-  // the render context must exist before the libmpv VO opens the file.
-  for (int i = 0; i < 2; i++) {
-    const char* load_command[] = {"loadfile", sides[i].path, "replace", NULL};
-    mpv_command(sides[i].mpv, load_command);
-  }
+  int eof[2] = {0, 0};
+  int current_track = 0;
 
   for (int i = 0; i < 2; i++) {
     mpv_observe_property(sides[i].mpv, 0, "time-pos", MPV_FORMAT_DOUBLE);
@@ -1425,7 +1602,12 @@ static void* control_thread_main(void* arg) {
     mpv_observe_property(sides[i].mpv, 0, "pause", MPV_FORMAT_FLAG);
     mpv_observe_property(sides[i].mpv, 0, "hwdec-current", MPV_FORMAT_STRING);
     mpv_observe_property(sides[i].mpv, 0, "frame-drop-count", MPV_FORMAT_INT64);
+    mpv_observe_property(sides[i].mpv, 0, "eof-reached", MPV_FORMAT_FLAG);
   }
+
+  // The control thread owns all non-render libmpv calls, including loadfile;
+  // the render context must exist before the libmpv VO opens the file.
+  worker_load_track(0, atomic_load(&g_autoplay), &paused_state, eof, &current_track);
 
   for (;;) {
     const int running = atomic_load(&control_running);
@@ -1436,7 +1618,7 @@ static void* control_thread_main(void* arg) {
 
     Command command;
     while (read(cmd_pipe[0], &command, sizeof(command)) == (ssize_t)sizeof(command)) {
-      worker_execute(&command, times, &duration, &paused_state, &sync_suppress);
+      worker_execute(&command, times, &duration, &paused_state, &sync_suppress, eof, &current_track);
     }
 
     for (int i = 0; i < 2; i++) {
@@ -1467,6 +1649,11 @@ static void* control_thread_main(void* arg) {
             atomic_store(&g_hwdec[i], hwdec_code(value));
           } else if (strcmp(prop->name, "frame-drop-count") == 0 && prop->format == MPV_FORMAT_INT64) {
             atomic_store(&g_drops[i], (long long)*(int64_t*)prop->data);
+          } else if (strcmp(prop->name, "eof-reached") == 0 && prop->format == MPV_FORMAT_FLAG) {
+            if (*(int*)prop->data != 0) {
+              eof[i] = 1;
+              worker_advance_if_ready(&paused_state, eof, &current_track);
+            }
           }
         } else if (event->event_id == MPV_EVENT_LOG_MESSAGE) {
           mpv_event_log_message* message = (mpv_event_log_message*)event->data;
@@ -1475,7 +1662,11 @@ static void* control_thread_main(void* arg) {
           mpv_event_end_file* end = (mpv_event_end_file*)event->data;
           if (end->reason == MPV_END_FILE_REASON_ERROR) {
             fprintf(stderr, "playback error: %s\n", mpv_error_string(end->error));
+            eof[i] = 1;
+          } else if (end->reason == MPV_END_FILE_REASON_EOF) {
+            eof[i] = 1;
           }
+          worker_advance_if_ready(&paused_state, eof, &current_track);
         } else if (event->event_id == MPV_EVENT_SHUTDOWN) {
           atomic_store(&mpv_shutdown, 1);
         }
@@ -1527,6 +1718,13 @@ static void* control_thread_main(void* arg) {
 // ------------------------------------------------------------ UI-side control
 
 static void set_pause(int pause) {
+  if (!pause && atomic_load(&g_list_ended) > 0) {
+    // The playlist stopped at the end; restarted playback replays this track.
+    paused = 0;
+    send_command(CMD_LOAD_TRACK, (double)atomic_load(&g_track));
+    set_toast("重新播放");
+    return;
+  }
   paused = pause;
   send_command(CMD_PAUSE, pause ? 1.0 : 0.0);
   set_toast(pause ? "已暂停" : "播放");
@@ -1575,9 +1773,9 @@ static void apply_speed(double new_speed) {
 }
 
 static void toggle_loop(void) {
-  loop_enabled = !loop_enabled;
-  send_command(CMD_LOOP, loop_enabled ? 1.0 : 0.0);
-  set_toast(loop_enabled ? "循环播放：开" : "循环播放：关");
+  loop_enabled = atomic_load(&g_list_loop) ? 0 : 1;
+  atomic_store(&g_list_loop, loop_enabled);
+  set_toast(loop_enabled ? "列表循环：开" : "列表循环：关");
 }
 
 static void print_stats(void) {
@@ -1589,6 +1787,38 @@ static void print_stats(void) {
 
 static void update_playback_state(void) {
   int changed = 0;
+
+  static int last_track = 0;
+  const int track = atomic_load(&g_track);
+  const int total_tracks = atomic_load(&g_track_total);
+  if (track != last_track) {
+    last_track = track;
+    for (int i = 0; i < 2; i++) {
+      sides[i].path = track_path(i, track);
+      sides[i].name = base_name(sides[i].path);
+    }
+    char title[2048];
+    snprintf(title, sizeof(title), "mpv compare — %s | %s", sides[0].name != NULL ? sides[0].name : "", sides[1].name != NULL ? sides[1].name : "");
+    set_window_title(title);
+    position = 0.0;
+    duration = 0.0;
+    position_override_until = 0.0;
+    if (total_tracks > 1) {
+      char message[64];
+      snprintf(message, sizeof(message), "第 %d/%d 个", track + 1, total_tracks);
+      set_toast(message);
+    }
+    changed = 1;
+  }
+  static int last_list_ended = 0;
+  const int list_ended = atomic_load(&g_list_ended);
+  if (list_ended != last_list_ended) {
+    last_list_ended = list_ended;
+    set_toast("播放列表结束");
+    changed = 1;
+  }
+  loop_enabled = atomic_load(&g_list_loop);
+
   const double duration_value = atomic_load(&g_duration);
   const double position_value = atomic_load(&g_time[0]);
   const double speed_value = atomic_load(&g_speed);
@@ -1800,8 +2030,8 @@ static void dump_framebuffer(const char* path) {
 // ---------------------------------------------------------------- main
 
 int main(int argc, char** argv) {
-  const char* paths[2] = {NULL, NULL};
-  int path_count = 0;
+  const char* sources[2] = {NULL, NULL};
+  int source_count = 0;
 
   const char* hwdec_env = getenv("MPVC_HWDEC");
   if (hwdec_env != NULL && hwdec_env[0] != '\0') {
@@ -1820,13 +2050,29 @@ int main(int argc, char** argv) {
         window_width = w;
         window_height = h;
       }
-    } else if (path_count < 2) {
-      paths[path_count++] = argv[i];
+    } else if (source_count < 2) {
+      sources[source_count++] = argv[i];
     }
   }
-  if (path_count < 2) {
-    fprintf(stderr, "usage: %s [--split 0.5] [--size WxH] [--hwdec auto-safe] left.mp4 right.mp4\n", argv[0]);
+  if (source_count < 1) {
+    fprintf(stderr, "usage: %s [--split 0.5] [--size WxH] [--hwdec auto-safe] left_source [right_source]\n", argv[0]);
+    fprintf(stderr, "  each source may be a video file or a directory of videos\n");
     return 1;
+  }
+
+  // Build playlists. Directories are scanned and sorted naturally by name;
+  // a single source is mirrored on both sides.
+  int source_is_dir[2] = {0, 0};
+  source_is_dir[0] = build_playlist(sources[0], &playlists[0]);
+  source_is_dir[1] = build_playlist(source_count > 1 ? sources[1] : sources[0], &playlists[1]);
+  const int total_tracks = MAX(playlists[0].count, playlists[1].count);
+  atomic_store(&g_track_total, total_tracks > 0 ? total_tracks : 1);
+  atomic_store(&g_list_loop, (source_is_dir[0] || source_is_dir[1]) ? 1 : 0);
+  loop_enabled = atomic_load(&g_list_loop);
+
+  for (int i = 0; i < 2; i++) {
+    sides[i].path = track_path(i, 0);
+    sides[i].name = base_name(sides[i].path);
   }
   split = CLAMP(split, 0.0f, 1.0f);
   stats_enabled = getenv("MPVC_STATS") != NULL;
@@ -1838,6 +2084,7 @@ int main(int argc, char** argv) {
   }
   if (getenv("MPVC_AUTOPLAY") != NULL) {
     paused = 0;
+    atomic_store(&g_autoplay, 1);
   }
 
   signal(SIGPIPE, SIG_IGN);
@@ -1860,7 +2107,7 @@ int main(int argc, char** argv) {
   }
   {
     char title[1024];
-    snprintf(title, sizeof(title), "mpv compare — %s | %s", base_name(paths[0]), base_name(paths[1]));
+    snprintf(title, sizeof(title), "mpv compare — %s | %s", sides[0].name != NULL ? sides[0].name : "", sides[1].name != NULL ? sides[1].name : "");
     set_window_title(title);
   }
   create_egl();
@@ -1870,10 +2117,8 @@ int main(int argc, char** argv) {
   load_font();
   resize_targets(window_width, window_height);
 
-  sides[0].path = paths[0];
-  sides[1].path = paths[1];
-  init_side(&sides[0], paths[0]);
-  init_side(&sides[1], paths[1]);
+  init_side(&sides[0]);
+  init_side(&sides[1]);
 
   if (pthread_create(&control_thread, NULL, control_thread_main, NULL) != 0) {
     die("cannot start control thread");
