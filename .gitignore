@@ -1,0 +1,8 @@
+/sysroot/
+/linklib/
+/debs/
+/mpv-compare
+*.o
+*.log
+*.bmp
+*.ppm
