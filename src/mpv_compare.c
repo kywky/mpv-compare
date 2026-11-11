@@ -804,6 +804,30 @@ static void rect_add(float x, float y, float w, float h, Color color) {
   }
 }
 
+static void triangle_add(float x0, float y0, float x1, float y1, float x2, float y2, Color color) {
+  if (rect_vertex_count + 18 > rect_capacity) {
+    size_t capacity = rect_capacity == 0 ? 4096 : rect_capacity * 2;
+    GLfloat* grown = realloc(rect_vertices, capacity * sizeof(GLfloat));
+    if (grown == NULL) {
+      return;
+    }
+    rect_vertices = grown;
+    rect_capacity = capacity;
+  }
+  const float px[3] = {x0, x1, x2};
+  const float py[3] = {y0, y1, y2};
+  for (int i = 0; i < 3; i++) {
+    GLfloat* out = rect_vertices + rect_vertex_count;
+    out[0] = px[i] / (float)window_width * 2.0f - 1.0f;
+    out[1] = 1.0f - py[i] / (float)window_height * 2.0f;
+    out[2] = color.r;
+    out[3] = color.g;
+    out[4] = color.b;
+    out[5] = color.a;
+    rect_vertex_count += 6;
+  }
+}
+
 // ---------------------------------------------------------------- rendering
 
 static void create_side_target(Side* side, int width, int height) {
@@ -903,6 +927,14 @@ static int ui_bottom_bar_height(void) {
   return ui_px(58.0f);
 }
 
+static void play_button_rect(float* x, float* y, float* width, float* height) {
+  const float size = (float)ui_px(26.0f);
+  *width = size;
+  *height = size;
+  *x = (float)ui_px(14.0f);
+  *y = (float)(window_height - ui_bottom_bar_height() + ui_px(4.0f));
+}
+
 static void draw_ui(void) {
   const int w = window_width;
   const int h = window_height;
@@ -951,9 +983,25 @@ static void draw_ui(void) {
   format_time(position, position_text, sizeof(position_text));
   format_time(duration, duration_text, sizeof(duration_text));
 
+  // Play/pause button at the left of the bottom bar.
+  float button_x = 0.0f;
+  float button_y = 0.0f;
+  float button_w = 0.0f;
+  float button_h = 0.0f;
+  play_button_rect(&button_x, &button_y, &button_w, &button_h);
+  const Color button_bg = {1.0f, 1.0f, 1.0f, 0.16f};
+  rect_add(button_x, button_y, button_w, button_h, button_bg);
+  if (paused) {
+    triangle_add(button_x + button_w * 0.34f, button_y + button_h * 0.22f, button_x + button_w * 0.34f, button_y + button_h * 0.78f, button_x + button_w * 0.76f,
+                 button_y + button_h * 0.50f, COLOR_WHITE);
+  } else {
+    rect_add(button_x + button_w * 0.30f, button_y + button_h * 0.24f, button_w * 0.14f, button_h * 0.52f, COLOR_WHITE);
+    rect_add(button_x + button_w * 0.56f, button_y + button_h * 0.24f, button_w * 0.14f, button_h * 0.52f, COLOR_WHITE);
+  }
+
   char time_label[160];
   snprintf(time_label, sizeof(time_label), "%s / %s", position_text, duration_text);
-  text_draw(bar_x, (float)(h - bar_height + ui_px(6.0f)), COLOR_WHITE, time_label);
+  text_draw(button_x + button_w + (float)ui_px(12.0f), (float)(h - bar_height + ui_px(6.0f)), COLOR_WHITE, time_label);
 
   char status[160];
   snprintf(status, sizeof(status), "%s  %.2fx%s", paused ? "PAUSED" : "PLAY", speed, loop_enabled ? "  LOOP" : "");
@@ -988,7 +1036,7 @@ static void draw_ui(void) {
         "H         显示 / 隐藏本帮助",
         "Q / ESC   退出",
         "",
-        "鼠标左键拖动分割线，拖动底部进度条跳转",
+        "鼠标：拖动分割线 / 拖动进度条 / 点击左下角按钮播放暂停",
         NULL,
     };
 
@@ -1579,9 +1627,18 @@ static void update_playback_state(void) {
 
 // ---------------------------------------------------------------- UI input
 
+static int play_button_hit(int x, int y) {
+  float bx = 0.0f;
+  float by = 0.0f;
+  float bw = 0.0f;
+  float bh = 0.0f;
+  play_button_rect(&bx, &by, &bw, &bh);
+  return (float)x >= bx && (float)x <= bx + bw && (float)y >= by && (float)y <= by + bh;
+}
+
 static int progress_bar_hit(int x, int y) {
   (void)x;
-  const int bar_top = window_height - ui_bottom_bar_height();
+  const int bar_top = window_height - ui_px(30.0f);
   return y >= bar_top && y <= window_height;
 }
 
@@ -1610,7 +1667,9 @@ static void handle_x_events(void) {
 
       case ButtonPress:
         if (event.xbutton.button == Button1) {
-          if (progress_bar_hit(event.xbutton.x, event.xbutton.y)) {
+          if (play_button_hit(event.xbutton.x, event.xbutton.y)) {
+            set_pause(!paused);
+          } else if (progress_bar_hit(event.xbutton.x, event.xbutton.y)) {
             dragging_progress = 1;
             seek_from_progress_x(event.xbutton.x, 1);
           } else if (event.xbutton.y < window_height - ui_bottom_bar_height()) {
