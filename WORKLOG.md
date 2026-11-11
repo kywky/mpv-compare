@@ -4,6 +4,9 @@
 目标：在银河麒麟 V10 ARM（芯瞳 GenBu02）上，对两路 4K30 视频做流畅的并排/划像对比。
 最终采用方案：**mpv-compare（libmpv + EGL/GLES 单窗口双路合成）**。
 
+> 说明：文中出现的发行版/显卡型号仅为开发与测试记录，程序本身不依赖特定厂商。
+> 硬解模式默认透传 mpv 的 `auto-safe`，可用 `--hwdec` / `MPVC_HWDEC` 覆盖。
+
 ---
 
 ## 1. 环境与基线
@@ -144,6 +147,15 @@
 验证：连续 15 次快速 seek 无死锁；暂停下逐帧 ±33ms；截图/缩放/全屏/变速/循环正常；
 全屏 30fps、CPU ≈16%、RSS ≈280MB。
 
+## 5.2 通用化调整
+
+- 默认硬解从 `vaapi` 改为 mpv 的 `auto-safe`，新增 `--hwdec <mode>` 与 `MPVC_HWDEC` 覆盖；
+  实测 `auto-safe` 在目标机上同样选中 `vaapi[nv12]` 零拷贝。
+- 移除 `LIBVA_DRIVER_NAME` 的强制默认（包装脚本已删除，二进制直接安装到 `/usr/bin`）；
+  验证不设置该变量时同样走 VAAPI 零拷贝。
+- 字体候选扩充到 Noto CJK / 文泉驿 / Droid / DejaVu，可用 `MPVC_FONT` 覆盖。
+- README 去掉“依赖特定发行版/显卡”的表述，测试环境改为“仅供参考”。
+
 ## 6. 产物与使用
 
 - 源码：`/mnt/aicode/tools/mpv-compare/src/mpv_compare.c`
@@ -156,8 +168,11 @@
 
 ```sh
 cd ~/mpv-compare
-LIBVA_DRIVER_NAME=genbu ./run.sh 左.mp4 右.mp4
+./run.sh 左.mp4 右.mp4
 ```
+
+（早期测量时命令里带过 `LIBVA_DRIVER_NAME=genbu`；后续验证确认 libva 默认即可选中
+genbu 驱动，不加该变量同样走 `vaapi[nv12]` 零拷贝，因此不再要求设置。）
 
 控制：空格播放/暂停；←/→ 前后 5 秒；`,`/`.` 逐帧；`[`/`]` 变速；`L` 循环；`S` 截图；
 `F` 全屏；`0` 分割线居中；`H` 帮助；`Q`/Esc 退出；鼠标拖动分割线/进度条。

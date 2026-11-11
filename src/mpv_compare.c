@@ -171,6 +171,7 @@ static int atlas_cursor_y = 0;
 static int atlas_row_height = 0;
 static const int ATLAS_SIZE = 1024;
 
+static const char* hwdec_mode = "auto-safe";
 static float split = 0.5f;
 static int dragging_split = 0;
 static int dragging_progress = 0;
@@ -505,14 +506,18 @@ static void create_text_pipeline(void) {
 // ---------------------------------------------------------------- font / text
 
 static void load_font(void) {
-  const char* candidates[8];
+  const char* candidates[12];
   int candidate_count = 0;
   const char* env_font = getenv("MPVC_FONT");
   if (env_font != NULL) {
     candidates[candidate_count++] = env_font;
   }
   candidates[candidate_count++] = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc";
+  candidates[candidate_count++] = "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc";
+  candidates[candidate_count++] = "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc";
+  candidates[candidate_count++] = "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc";
   candidates[candidate_count++] = "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf";
+  candidates[candidate_count++] = "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf";
   candidates[candidate_count++] = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
   candidates[candidate_count] = NULL;
 
@@ -1146,7 +1151,7 @@ static void init_side(Side* side, const char* path) {
   }
 
   check_mpv(mpv_set_option_string(side->mpv, "vo", "libmpv"), "vo=libmpv");
-  check_mpv(mpv_set_option_string(side->mpv, "hwdec", "vaapi"), "hwdec=vaapi");
+  check_mpv(mpv_set_option_string(side->mpv, "hwdec", hwdec_mode), "hwdec");
   check_mpv(mpv_set_option_string(side->mpv, "audio", "no"), "audio=no");
   check_mpv(mpv_set_option_string(side->mpv, "pause", "yes"), "pause=yes");
   check_mpv(mpv_set_option_string(side->mpv, "keep-open", "yes"), "keep-open");
@@ -1739,9 +1744,16 @@ int main(int argc, char** argv) {
   const char* paths[2] = {NULL, NULL};
   int path_count = 0;
 
+  const char* hwdec_env = getenv("MPVC_HWDEC");
+  if (hwdec_env != NULL && hwdec_env[0] != '\0') {
+    hwdec_mode = hwdec_env;
+  }
+
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--split") == 0 && i + 1 < argc) {
       split = (float)atof(argv[++i]);
+    } else if (strcmp(argv[i], "--hwdec") == 0 && i + 1 < argc) {
+      hwdec_mode = argv[++i];
     } else if (strcmp(argv[i], "--size") == 0 && i + 1 < argc) {
       int w = 0;
       int h = 0;
@@ -1754,7 +1766,7 @@ int main(int argc, char** argv) {
     }
   }
   if (path_count < 2) {
-    fprintf(stderr, "usage: %s [--split 0.5] [--size WxH] left.mp4 right.mp4\n", argv[0]);
+    fprintf(stderr, "usage: %s [--split 0.5] [--size WxH] [--hwdec auto-safe] left.mp4 right.mp4\n", argv[0]);
     return 1;
   }
   split = CLAMP(split, 0.0f, 1.0f);
