@@ -10,6 +10,7 @@
 ## 功能
 
 - 输入可以是视频文件或目录：两个目录会扫描视频、按名称自然排序并逐对播放；只给一个输入时左右共用同一列表
+- 打开即自动播放；需要停在第 0 帧时用 `--pause` 或 `MPVC_AUTOPLAY=0`
 - 单窗口左右对比，垂直分割线可拖动（左键点击画面也会把分割线移过去）
 - 底部播放/暂停按钮、进度条、时间状态显示；进度条点击/拖动跳转（左右同步 seek）
 - 顶部显示左右文件名（支持中文，自动选系统 CJK 字体）
@@ -105,9 +106,9 @@ make
 参数与环境变量：
 
 ```sh
-./mpv-compare [--split 0.5] [--size 1920x1080] [--hwdec auto-safe] left_source [right_source]
+./mpv-compare [--pause] [--split 0.5] [--size 1920x1080] [--hwdec auto-safe] left_source [right_source]
 MPVC_HWDEC=vaapi  # 硬解模式（透传给 mpv；命令行 --hwdec 优先）
-MPVC_AUTOPLAY=1   # 启动即播放（默认暂停在第一帧）
+MPVC_AUTOPLAY=0   # 启动时暂停在第一帧（默认自动播放）
 MPVC_STATS=1      # 每秒打印 time-pos / hwdec-current / 掉帧 / 出帧率
 MPVC_DUMP=/tmp/x.ppm MPVC_DUMP_AT=8   # 第 8 秒把合成画面存为 PPM（便于无界面验证）
 MPVC_FONT=/path/to/font.ttf           # 指定 UI 字体

@@ -187,12 +187,12 @@ static atomic_int g_track = 0;
 static atomic_int g_track_total = 1;
 static atomic_int g_list_loop = 0;
 static atomic_int g_list_ended = 0;
-static atomic_int g_autoplay = 0;
+static atomic_int g_autoplay = 1;
 
 static float split = 0.5f;
 static int dragging_split = 0;
 static int dragging_progress = 0;
-static int paused = 1;
+static int paused = 0;
 static volatile int quit = 0;
 static int dirty = 1;
 static int force_render = 0;
@@ -2043,6 +2043,9 @@ int main(int argc, char** argv) {
       split = (float)atof(argv[++i]);
     } else if (strcmp(argv[i], "--hwdec") == 0 && i + 1 < argc) {
       hwdec_mode = argv[++i];
+    } else if (strcmp(argv[i], "--pause") == 0) {
+      paused = 1;
+      atomic_store(&g_autoplay, 0);
     } else if (strcmp(argv[i], "--size") == 0 && i + 1 < argc) {
       int w = 0;
       int h = 0;
@@ -2055,7 +2058,7 @@ int main(int argc, char** argv) {
     }
   }
   if (source_count < 1) {
-    fprintf(stderr, "usage: %s [--split 0.5] [--size WxH] [--hwdec auto-safe] left_source [right_source]\n", argv[0]);
+    fprintf(stderr, "usage: %s [--pause] [--split 0.5] [--size WxH] [--hwdec auto-safe] left_source [right_source]\n", argv[0]);
     fprintf(stderr, "  each source may be a video file or a directory of videos\n");
     return 1;
   }
@@ -2082,9 +2085,11 @@ int main(int argc, char** argv) {
   } else if (dump_path != NULL) {
     dump_at = 3.0;
   }
-  if (getenv("MPVC_AUTOPLAY") != NULL) {
-    paused = 0;
-    atomic_store(&g_autoplay, 1);
+  const char* autoplay_env = getenv("MPVC_AUTOPLAY");
+  if (autoplay_env != NULL) {
+    const int enable = strcmp(autoplay_env, "0") != 0 && strcmp(autoplay_env, "no") != 0 && strcmp(autoplay_env, "false") != 0;
+    paused = enable ? 0 : 1;
+    atomic_store(&g_autoplay, enable ? 1 : 0);
   }
 
   signal(SIGPIPE, SIG_IGN);
